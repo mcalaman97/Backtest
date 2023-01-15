@@ -1,0 +1,110 @@
+class Portfolio:
+    """This is the class is an object containing actual portfolio.
+    The strategy is to decide the weights of the portfolio is not defined in this class.
+    A Portfolio object has weights that are updated using the method rebalance.
+    Returns Data are loaded from yahoo finance.
+    start_date: string in the "YYYY-MM-DD" format --> start date of the backtest
+    end_date: string in the "YYYY-MM-DD" format --> start date of the backtest
+    investment_universe: list of tickers used throughout the life of the portfolio  
+    ptf_size: int --> dollar size of the ptf at inception
+    monthly_data: string --> optional parameter, if different from 'N', then the function loads monthly data"""
+    
+    def __init__(self, start_date, end_date, investment_universe,  ptf_size, monthly_data = "N"):
+        # initialating the class
+        # here I am creating a few attributes with the specifications of the backtest
+        self.ptf_size = ptf_size
+        self.start_date = start_date
+        self.end_date = end_date
+        self.investment_universe = investment_universe
+        self.tickers = investment_universe + ["CASH"]
+        # loading data from yahoo finance
+        if (monthly_data != "N"):
+            self.raw_prices = self.__load_monthly_prices_from_yahoo_finance(self.investment_universe, 
+                                    start = self.start_date, end = end_date)
+        else:
+            self.raw_prices = self.__load_prices_from_yahoo_finance(self.investment_universe, start = self.start_date,
+                                                end = end_date)
+        # creating the matrices of prices, returns and weights
+        self.prices = self.__format_yahoo_finance_prices(self.raw_prices)
+        self.returns = self.prices.pct_change().iloc[1:,:].copy()
+        self.returns["CASH"] = 0
+        self.returns.index = pd.to_datetime(self.returns.index).date
+        self.dates = [date for date in pd.to_datetime(self.prices.index).date]
+        self.w = pd.DataFrame(0, index = self.dates, columns = self.tickers)
+        self.w["CASH"] = 1
+        self.w.columns = self.returns.columns
+        self._get_index_levels()
+        
+    def __load_prices_from_yahoo_finance(self, list_tickers, start, end):
+        """ This function loads data from yahoo finance if the frequqency of data is not specified (default frequency: daily)"""
+        return yf.download(list_tickers , start = start, end=end, group_by='tickers')
+    
+    def __load_monthly_prices_from_yahoo_finance(self, list_tickers, start, end):
+        """ This function loads data from yahoo finance if the frequqency of data is monthly data"""
+        data_prices = yf.download(list_tickers , start = start, end=end, interval='1mo', group_by='tickers')
+        data_prices = data_prices.dropna(axis=0,how='any')
+        return data_prices
+ 
+    def __format_yahoo_finance_prices(self, df):
+        """ This method formats the raw data loaded from yahoo finanace"""
+        dx = df.iloc[:, (df.columns.get_level_values(1) == "Adj Close")].copy()
+        dx.columns = dx.columns.droplevel(1)
+        return dx
+    
+    def _get_index_levels(self):
+        """ this method computes period and cumulative portfolio returns based of the matrix of weights self.w and matrix of returns self.returns"""
+        mat_w = self.w.iloc[:-1,].copy()
+        mat_w.index = self.returns.index
+        self.index_levels = ((mat_w * (self.returns + 1)).sum(1)).cumprod()
+        self.index_returns = ((mat_w * (self.returns + 1)).sum(1)) - 1
+
+    def rebalance(self, rebal_date, dict_ticker_w):
+        """ This is the method used to update the matrix of weights once a new trade is inserted
+        rebal_date: datetime.date, this is the date where I am going to modify the portfolio weights (assumption, trade happens as marte close the previous day)
+        dict_ticker_w: dictionary, this contains the weights of the new portfolio. each key is a ticker of one of the constituents of the portfolio,
+         each value is its associated weight in the portfolio. If a security in the investment_universe is not in this dictionary, then it gets a weight equal to zero"""
+        # this is the row of weights that I want to update in the matrix of weights self.w
+        row = self.w.loc[rebal_date]
+        # update the weights for the identifiers in the dictionary
+        row.update(pd.Series(dict_ticker_w))
+        # set the weights for identifiers not in the dictionary to 0
+        for col in self.w.columns:
+            if col not in dict_ticker_w.keys():
+                row[col] = 0
+        # update the row in the matrix
+        self.w.loc[rebal_date] = row
+        # now I need to update the rest of the matrix of weights
+        # in fact, there is path-dependecy and most recent weights will depend of the new set of weights and future returns
+        # weights at time T1 will be weights at time T0 times returns from T0 to T1... Divided by their sum
+        # I start by updating weights at time 0 as the trade has effectively happened at the end of t-1
+        self.w.loc[rebal_date] = (self.w.loc[rebal_date] * (self.returns.loc[rebal_date] + 1))
+        self.w.loc[rebal_date] = self.w.loc[rebal_date].div(self.w.loc[rebal_date].sum())
+        # then I update the rest of the matrix of weights
+        self.w.loc[(self.w.index > rebal_date)] = (self.returns[(self.returns.index > rebal_date)] + 1) 
+        self.w.loc[(self.w.index >= rebal_date)] = self.w.loc[(self.w.index >= rebal_date)].cumprod(axis = 0) 
+        self.w = self.w.div(self.w.sum(1), axis=0)
+
+
+    def load_FF_returns(self):
+        print("Loading Fama French Returns")
+        ff_url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
+        # Download the file and save it
+        # We will name it fama_french.zip file
+        urllib.request.urlretrieve(ff_url,'fama_french.zip')
+        zip_file = zipfile.ZipFile('fama_french.zip', 'r')
+        # Next we extact the file data
+        # We will call it ff_factors.csv
+        zip_file.extractall()
+        # Make sure you close the file after extraction
+        zip_file.close()
+        ff_factors = pd.read_csv('F-F_Research_Data_Factors.csv', skiprows = 3)
+        ff_factors = ff_factors.loc[ff_factors.index < (ff_factors[(ff_factors["Unnamed: 0"] == " Annual Factors: January-December ")].index[0])]
+        ff_factors["year"] = (ff_factors["Unnamed: 0"].str[:4]).astype("int")
+        ff_factors["month"] = (ff_factors["Unnamed: 0"].str[4:6]).astype("int")
+        ff_factors["day"] = 1
+        ff_factors["date"] = pd.to_datetime(ff_factors[['year', 'month', 'day']])
+        ff_factors = ff_factors.set_index("date")
+        ff_factors = ff_factors[["Mkt-RF","SMB","HML","RF"]].astype("float")
+        ff_factors = ff_factors.loc[(ff_factors.index.date>=min(self.returns.index))&(ff_factors.index.date<=max(self.returns.index))]/100
+        self.ff_factors = ff_factors
+        print("Fama French Returns loaded")        
