@@ -1,5 +1,5 @@
 # Portfolio Backtesting
-This script allows users to backtest their investment strategies using historical data from Yahoo Finance. The script loads data for securities in the portfolio, and users can enter the weights of the portfolio for each rebalance date where they trade. The script uses the yfinance library to load data from Yahoo Finance, pandas for data manipulation, and scipy for optimization.
+This script allows users to backtest investment strategies using historical data from Yahoo Finance. The class Portfolio loads data for securities in the portfolio, and users can enter the weights of the portfolio for each rebalance date where they trade. Weights at rebalance are provided as input through the rebalance() method. This means that the actual investment strategy is ran in a different class. The script uses the yfinance library to load data from Yahoo Finance, pandas for data manipulation, and scipy for optimization. Additionally, factors returns are loaded from Kenneth R. French data library.
 
 # Usage
 Create an instance of the Portfolio class. The class takes the following parameters:
