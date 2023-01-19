@@ -1,3 +1,15 @@
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import datetime
+import datetime as dt
+from scipy.optimize import minimize
+from dateutil.relativedelta import relativedelta
+import urllib.request
+import zipfile
+
+
 class Portfolio:
     """This is the class is an object containing actual portfolio.
     The strategy is to decide the weights of the portfolio is not defined in this class.
@@ -83,8 +95,18 @@ class Portfolio:
         self.w.loc[(self.w.index > rebal_date)] = (self.returns[(self.returns.index > rebal_date)] + 1) 
         self.w.loc[(self.w.index >= rebal_date)] = self.w.loc[(self.w.index >= rebal_date)].cumprod(axis = 0) 
         self.w = self.w.div(self.w.sum(1), axis=0)
+        self._get_index_levels()
 
 
+
+        
+class InvestmentStrategy(Portfolio):
+    """ This is child class will serve as blueprint for the various investment strategies that we are going to implement. 
+    The logic is to separate the backtesting engine from anything related to the actual strategy. 
+    In particular, I am using this function to host all the method to load specific datasets that are not strictly related to the backetest itself."""
+    def __init__(self, start_date, end_date, investment_universe,  ptf_size , monthly_data = "N"):
+        super().__init__(start_date, end_date, investment_universe,  ptf_size, monthly_data)
+    
     def load_FF_returns(self):
         print("Loading Fama French Returns")
         ff_url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
@@ -107,4 +129,74 @@ class Portfolio:
         ff_factors = ff_factors[["Mkt-RF","SMB","HML","RF"]].astype("float")
         ff_factors = ff_factors.loc[(ff_factors.index.date>=min(self.returns.index))&(ff_factors.index.date<=max(self.returns.index))]/100
         self.ff_factors = ff_factors
-        print("Fama French Returns loaded")        
+        print("Fama French Returns loaded")
+    
+    def load_Treasury_Par_Yield_Curve(self, start_year = 2015, read_local_file = True, file_name = "Treasury_Par_Yield_Curve_Rates.csv"):
+        # data loading
+        if read_local_file == True:
+            df_rf = pd.read_csv(file_name)
+        else:
+            print("Scraping data from the Treasury Department website")
+            list_df = [pd.read_csv("https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/" + str(year) + "/all?type=daily_treasury_yield_curve&field_tdr_date_value="+ str(year) + "&page&_format=csv") for year in range(start_year, (datetime.now().year + 1))]
+            print("Data loaded! Saving data in the file Treasury_Par_Yield_Curve_Rates_" + str(start_year) + "_" + str(datetime.now().year) + ".csv")
+            df_rf = pd.concat(list_df)
+            df_rf.to_csv("Treasury_Par_Yield_Curve_Rates_" + str(start_year) + "_" + str(datetime.now().year) + ".csv")
+        # data cleaning
+        df_rf = df_rf[['Date', '1 Mo', '2 Mo', '3 Mo', '4 Mo', '6 Mo', '1 Yr', '2 Yr', '3 Yr', '5 Yr', '7 Yr',
+               '10 Yr', '20 Yr', '30 Yr']]
+        df_rf.reset_index(drop = True, inplace = True)
+        df_rf.index = df_rf["Date"].apply(pd.to_datetime)
+        df_rf.sort_index(inplace=True)
+        df_rf.drop("Date", axis = 1, inplace = True)
+        df_rf /= 100
+        self.rf = df_rf 
+        
+class RollingSharpeRatio(InvestmentStrategy):
+    """This is an investment strategy that uses the 12-month rolling Sharpe Ratio as an alpha signal.
+    The idea is that when markets reach a given level in terms of risk adjusted returns, then PMs may want to deleverage a bit.
+    This is strategy is UW momentum.
+    This class is a child class of InvestmentStrategy.
+    The most important method of this strategy is run_strategy()"""
+    def __init__(self, start_date, end_date, investment_universe,  ptf_size ,   monthly_data = "Y"):
+        super().__init__(start_date, end_date, investment_universe,  ptf_size, monthly_data)
+    
+    def run_strategy(self, reference_index, target_beta, trigger_level, rolling_window = 12, secondary_investment = "CASH"):
+        """This function is called to implement the investment strategy.
+        reference_index: string, one of the constituents of the investment_universe. This is the security that will produce our alpha signals
+        target beta: float, equivalent to the beta/weight of the reference_index that we want to keep when UW 
+        trigger_level: float, level of the Sharpe Ratio that will trigger the UW/OW
+        rolling_window: int, number of observations used to compute the Sharpe Ratio. 12 by default as we are working with monthly data
+        secondary_investment: string, security in the investment universe where we will allocate cash when UW """
+        # loading the required data
+        self.load_Treasury_Par_Yield_Curve()
+        
+        # creating the some attributes
+        self.reference_index = reference_index
+        self.rolling_window = rolling_window
+        self.target_beta = target_beta
+        self.trigger_level = trigger_level
+        
+        self.strategy_data = pd.merge(self.returns, self.rf[["1 Yr"]], how = "left", left_index = True, right_index=True)
+        self.strategy_data.fillna(method='ffill', inplace=True)
+        
+        #computing the rolling Sharpe Ratio
+        self.strategy_data["rolling_ret"] = (((self.strategy_data[reference_index]+1).rolling(self.rolling_window).apply(np.prod)) ** (12/self.rolling_window)) - 1
+        self.strategy_data["rolling_vol"] = ((self.strategy_data[reference_index]).rolling(self.rolling_window).apply(np.std)) * (12 ** 0.5)
+        self.strategy_data["rolling_Sharpe_Ratio"] = (self.strategy_data["rolling_ret"] - self.strategy_data["1 Yr"]).div(self.strategy_data["rolling_vol"])
+        
+        #creating signals
+        self.strategy_data.loc[(self.strategy_data["rolling_Sharpe_Ratio"].shift(2) < trigger) & (self.strategy_data["rolling_Sharpe_Ratio"].shift(1) >= trigger), "Trade"] = "Sell"
+        self.strategy_data.loc[(self.strategy_data["rolling_Sharpe_Ratio"].shift(2) > trigger) & (self.strategy_data["rolling_Sharpe_Ratio"].shift(1) <= trigger), "Trade"] = "Buy"
+        
+        # relevant dates
+        self.all_trading_dates = [trade_date.date() for trade_date in self.strategy_data.loc[self.strategy_data["Trade"].isna()==False].index]
+        self.sell_dates = [trade_date.date() for trade_date in self.strategy_data.loc[self.strategy_data["Trade"]=="Sell"].index]
+        self.buy_dates = [trade_date.date() for trade_date in self.strategy_data.loc[self.strategy_data["Trade"]=="Buy"].index]
+        
+        #trading the startegy
+        self.rebalance(self.strategy_data.index[0].date(), {self.reference_index: 1})
+        for date in all_trading_dates:
+            if date in self.sell_dates:
+                self.rebalance(date, {self.reference_index: self.target_beta, secondary_investment: (1-beta)})
+            elif date in self.buy_dates:
+                self.rebalance(date, {self.reference_index: 1})
